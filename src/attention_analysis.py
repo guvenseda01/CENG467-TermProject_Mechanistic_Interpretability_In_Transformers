@@ -1,253 +1,251 @@
 """
 attention_analysis.py
 ---------------------
-Utilities for loading a transformer model via TransformerLens,
-extracting attention patterns, and classifying attention head roles.
+Attention head extraction, subject-token ranking, and ablation helpers
+for GPT-2 mechanistic interpretability (CENG467 Group 7).
+
+All functions expect a TransformerLens HookedTransformer model.
 
 Usage:
-    from src.attention_analysis import load_model, get_attention_patterns, classify_heads
+    from src.attention_analysis import (
+        get_subject_token_indices,
+        find_top_subject_heads,
+        find_low_subject_heads,
+        ablate_heads_and_get_logits,
+        plot_subject_attention_heatmap,
+    )
 """
 
 from __future__ import annotations
 
-import torch
+import random
+from collections import defaultdict
+
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import seaborn as sns
-from typing import Optional
-from transformer_lens import HookedTransformer, utils
+import pandas as pd
+import torch
+from transformer_lens import HookedTransformer
 
 
 # ---------------------------------------------------------------------------
-# Model loading
+# Subject token localisation
 # ---------------------------------------------------------------------------
 
-def load_model(model_name: str = "gpt2", device: Optional[str] = None) -> HookedTransformer:
-    """
-    Load a HookedTransformer model for interpretability analysis.
-
-    Args:
-        model_name: HuggingFace / TransformerLens model identifier.
-        device: 'cpu' or 'cuda'. Auto-detected if None.
-
-    Returns:
-        A HookedTransformer model in eval mode.
-    """
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model = HookedTransformer.from_pretrained(model_name, device=device)
-    model.eval()
-    print(f"Loaded '{model_name}' on {device}  |  "
-          f"{model.cfg.n_layers} layers, {model.cfg.n_heads} heads, "
-          f"d_model={model.cfg.d_model}")
-    return model
-
-
-# ---------------------------------------------------------------------------
-# Attention pattern extraction
-# ---------------------------------------------------------------------------
-
-def get_attention_patterns(
+def get_subject_token_indices(
     model: HookedTransformer,
     prompt: str,
-    layer: Optional[int] = None,
-) -> dict:
+    subject: str,
+) -> list[int]:
     """
-    Extract attention patterns for a given prompt.
+    Return the token positions of *subject* inside *prompt*.
+
+    Tries both space-prefixed and bare tokenisations; falls back to
+    substring matching if neither produces an exact span match.
 
     Args:
-        model: A HookedTransformer instance.
-        prompt: Input text.
-        layer: If specified, return patterns for that layer only.
-                If None, return all layers.
+        model:   HookedTransformer instance.
+        prompt:  Full prompt string.
+        subject: Entity string to locate.
 
     Returns:
-        Dictionary with keys:
-            - 'tokens'       : list of token strings
-            - 'attention'    : tensor of shape (n_layers, n_heads, seq, seq)  [or (n_heads, seq, seq) if layer given]
-            - 'logits'       : final logit tensor
+        Sorted list of token indices (may be empty if not found).
+    """
+    prompt_tokens = model.to_str_tokens(prompt)
+
+    candidates = [
+        model.to_str_tokens(subject,        prepend_bos=False),
+        model.to_str_tokens(" " + subject,  prepend_bos=False),
+    ]
+
+    for subject_tokens in candidates:
+        subject_clean = [t for t in subject_tokens if t != "<|endoftext|>"]
+        indices: list[int] = []
+        for start in range(len(prompt_tokens)):
+            span = prompt_tokens[start: start + len(subject_clean)]
+            if len(span) != len(subject_clean):
+                continue
+            if [t.strip() for t in span] == [t.strip() for t in subject_clean]:
+                indices.extend(range(start, start + len(subject_clean)))
+        if indices:
+            return sorted(set(indices))
+
+    # Fallback: substring match
+    subject_tokens_fb = [
+        t for t in model.to_str_tokens(subject, prepend_bos=False)
+        if t != "<|endoftext|>"
+    ]
+    indices = []
+    for i, token in enumerate(prompt_tokens):
+        if token == "<|endoftext|>":
+            continue
+        for st in subject_tokens_fb:
+            if st.strip() and st.strip() in token.strip():
+                indices.append(i)
+    return sorted(set(indices))
+
+
+# ---------------------------------------------------------------------------
+# Head ranking
+# ---------------------------------------------------------------------------
+
+def _rank_heads_by_subject(
+    model: HookedTransformer,
+    prompt: str,
+    subject: str,
+) -> pd.DataFrame | None:
+    """
+    Score every (layer, head) by the sum of final-query attention to subject tokens.
+
+    Returns a DataFrame sorted by score descending, or None if subject not found.
     """
     tokens = model.to_tokens(prompt)
-    token_strs = model.to_str_tokens(prompt)
+    _, cache = model.run_with_cache(tokens)
 
-    logits, cache = model.run_with_cache(tokens, remove_batch_dim=True)
+    subj_idx = get_subject_token_indices(model, prompt, subject)
+    if not subj_idx:
+        return None
 
-    if layer is not None:
-        attn = cache[f"blocks.{layer}.attn.hook_pattern"]  # (n_heads, seq, seq)
-        return {"tokens": token_strs, "attention": attn, "logits": logits}
+    rows = []
+    for layer in range(model.cfg.n_layers):
+        attn = cache[f"blocks.{layer}.attn.hook_pattern"][0]   # (n_heads, seq, seq)
+        for head in range(model.cfg.n_heads):
+            score = attn[head][-1].detach().cpu()[subj_idx].sum().item()
+            rows.append({"layer": layer, "head": head, "score": score})
 
-    all_attn = torch.stack(
-        [cache[f"blocks.{l}.attn.hook_pattern"] for l in range(model.cfg.n_layers)],
-        dim=0,
-    )  # (n_layers, n_heads, seq, seq)
-
-    return {"tokens": token_strs, "attention": all_attn, "logits": logits}
+    return pd.DataFrame(rows).sort_values("score", ascending=False)
 
 
-# ---------------------------------------------------------------------------
-# Head classification
-# ---------------------------------------------------------------------------
-
-def classify_heads(
+def find_top_subject_heads(
     model: HookedTransformer,
-    prompts: list[str],
-    threshold: float = 0.4,
-) -> dict[str, list[tuple[int, int]]]:
-    """
-    Classify attention heads into functional roles based on their patterns.
+    prompt: str,
+    subject: str,
+    top_k: int = 5,
+) -> list[tuple[int, int]]:
+    """Return the top-k (layer, head) pairs with the highest subject attention."""
+    df = _rank_heads_by_subject(model, prompt, subject)
+    if df is None:
+        return []
+    top = df.head(top_k)
+    return [(int(top.iloc[i]["layer"]), int(top.iloc[i]["head"])) for i in range(len(top))]
 
-    Roles detected:
-        - induction       : attends to the token following a previous occurrence of the current token
-        - duplicate_token : attends strongly to copies of the current token
-        - prev_token      : attends predominantly to the immediately preceding token
 
-    Args:
-        model: A HookedTransformer instance.
-        prompts: List of example prompts to evaluate heads over.
-        threshold: Minimum average attention weight to qualify for a role.
+def find_low_subject_heads(
+    model: HookedTransformer,
+    prompt: str,
+    subject: str,
+    top_k: int = 5,
+) -> list[tuple[int, int]]:
+    """Return the top-k (layer, head) pairs with the *lowest* subject attention (control)."""
+    df = _rank_heads_by_subject(model, prompt, subject)
+    if df is None:
+        return []
+    low = df.sort_values("score").head(top_k)
+    return [(int(low.iloc[i]["layer"]), int(low.iloc[i]["head"])) for i in range(len(low))]
 
-    Returns:
-        Dictionary mapping role name → list of (layer, head) tuples.
-    """
-    n_layers = model.cfg.n_layers
-    n_heads = model.cfg.n_heads
 
-    induction_scores     = torch.zeros(n_layers, n_heads)
-    duplicate_scores     = torch.zeros(n_layers, n_heads)
-    prev_token_scores    = torch.zeros(n_layers, n_heads)
-
-    for prompt in prompts:
-        tokens = model.to_tokens(prompt)
-        _, cache = model.run_with_cache(tokens, remove_batch_dim=True)
-        seq_len = tokens.shape[1]
-
-        for l in range(n_layers):
-            attn = cache[f"blocks.{l}.attn.hook_pattern"]  # (n_heads, seq, seq)
-
-            # --- Induction score: attn[h, i, i-1] where tokens[i] == tokens[i-n] ---
-            # Simplified: average attention on position (i, i-1) offset for repeated bigrams
-            if seq_len > 2:
-                induction_scores[l] += attn[:, 1:, :-1].diagonal(dim1=-2, dim2=-1).mean(-1)
-
-            # --- Prev-token score: attention on the immediately preceding token ---
-            if seq_len > 1:
-                prev_token_scores[l] += attn[:, 1:, :-1].diagonal(dim1=-2, dim2=-1).mean(-1)
-
-            # --- Duplicate-token score: attention on same-token positions ---
-            token_ids = tokens[0]  # (seq,)
-            dup_mask = (token_ids.unsqueeze(0) == token_ids.unsqueeze(1)).float()  # (seq, seq)
-            dup_mask.fill_diagonal_(0)
-            dup_attn = (attn * dup_mask.unsqueeze(0)).sum(-1).mean(-1)  # (n_heads,)
-            duplicate_scores[l] += dup_attn
-
-    n = len(prompts)
-    induction_scores  /= n
-    duplicate_scores  /= n
-    prev_token_scores /= n
-
-    def _top_heads(score_matrix: torch.Tensor, thresh: float):
-        heads = []
-        for l in range(n_layers):
-            for h in range(n_heads):
-                if score_matrix[l, h].item() > thresh:
-                    heads.append((l, h))
-        return heads
-
-    return {
-        "induction":       _top_heads(induction_scores,    threshold),
-        "duplicate_token": _top_heads(duplicate_scores,    threshold),
-        "prev_token":      _top_heads(prev_token_scores,   threshold),
-    }
+def get_random_heads(
+    model: HookedTransformer,
+    k: int,
+    seed: int = 42,
+) -> list[tuple[int, int]]:
+    """Return k randomly sampled (layer, head) pairs as a control group."""
+    rng = random.Random(seed)
+    all_heads = [
+        (l, h)
+        for l in range(model.cfg.n_layers)
+        for h in range(model.cfg.n_heads)
+    ]
+    return rng.sample(all_heads, k)
 
 
 # ---------------------------------------------------------------------------
-# Visualization
+# Ablation
 # ---------------------------------------------------------------------------
 
-def plot_attention_head(
-    attention: torch.Tensor,
-    tokens: list[str],
-    layer: int,
-    head: int,
-    ax: Optional[plt.Axes] = None,
-    title: Optional[str] = None,
-) -> plt.Axes:
+def ablate_heads_and_get_logits(
+    model: HookedTransformer,
+    prompt: str,
+    heads_to_ablate: list[tuple[int, int]],
+) -> torch.Tensor:
     """
-    Plot a single attention head's pattern as a heatmap.
+    Zero-ablate the listed (layer, head) pairs via hook_z and return logits.
+
+    Multiple heads in the same layer are handled in a single hook call to
+    avoid hook-registration conflicts.
 
     Args:
-        attention: Tensor of shape (n_layers, n_heads, seq, seq) or (n_heads, seq, seq).
-        tokens: List of token strings.
-        layer: Layer index (used when attention has 4 dims).
-        head: Head index.
-        ax: Matplotlib axes to draw on. Created if None.
-        title: Optional plot title.
+        model:           HookedTransformer instance.
+        prompt:          Input prompt string.
+        heads_to_ablate: List of (layer_idx, head_idx) pairs.
 
     Returns:
-        The matplotlib Axes object.
+        Logit tensor of shape (1, seq_len, vocab_size).
     """
-    if attention.dim() == 4:
-        attn_data = attention[layer, head].cpu().numpy()
-    else:
-        attn_data = attention[head].cpu().numpy()
+    tokens = model.to_tokens(prompt)
 
-    if ax is None:
-        _, ax = plt.subplots(figsize=(8, 6))
+    layer_to_heads: dict[int, list[int]] = defaultdict(list)
+    for layer, head in heads_to_ablate:
+        layer_to_heads[layer].append(head)
 
-    sns.heatmap(
-        attn_data,
-        xticklabels=tokens,
-        yticklabels=tokens,
-        ax=ax,
-        cmap="Blues",
-        vmin=0,
-        vmax=1,
-        cbar_kws={"shrink": 0.7},
-    )
-    ax.set_xlabel("Key (attended to)", fontsize=10)
-    ax.set_ylabel("Query (attending from)", fontsize=10)
-    ax.set_title(title or f"Layer {layer} · Head {head}", fontsize=12)
-    ax.tick_params(axis="x", rotation=45, labelsize=8)
-    ax.tick_params(axis="y", rotation=0, labelsize=8)
-    return ax
+    def make_hook(heads_in_layer: list[int]):
+        def hook_fn(value: torch.Tensor, hook) -> torch.Tensor:
+            # value: (batch, seq_len, n_heads, d_head)
+            for h in heads_in_layer:
+                value[:, :, h, :] = 0
+            return value
+        return hook_fn
+
+    fwd_hooks = [
+        (f"blocks.{layer}.attn.hook_z", make_hook(heads))
+        for layer, heads in layer_to_heads.items()
+    ]
+    return model.run_with_hooks(tokens, fwd_hooks=fwd_hooks)
 
 
-def plot_all_heads(
-    attention: torch.Tensor,
-    tokens: list[str],
-    layer: int,
-    figsize_per_head: tuple[int, int] = (4, 3),
+# ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
+
+def plot_subject_attention_heatmap(
+    model: HookedTransformer,
+    prompt: str,
+    subject: str,
+    save_path: str | None = None,
 ) -> plt.Figure:
     """
-    Plot all attention heads for a given layer in a grid.
+    Plot a (layer × head) heatmap of subject attention scores.
 
     Args:
-        attention: Tensor (n_layers, n_heads, seq, seq).
-        tokens: List of token strings.
-        layer: Which layer to visualize.
-        figsize_per_head: (width, height) per subplot cell.
+        model:     HookedTransformer instance.
+        prompt:    Input prompt string.
+        subject:   Subject entity string.
+        save_path: If given, save the figure to this path.
 
     Returns:
         The matplotlib Figure.
     """
-    n_heads = attention.shape[1]
-    ncols = min(4, n_heads)
-    nrows = (n_heads + ncols - 1) // ncols
+    tokens = model.to_tokens(prompt)
+    _, cache = model.run_with_cache(tokens)
+    subj_idx = get_subject_token_indices(model, prompt, subject)
 
-    fig, axes = plt.subplots(
-        nrows, ncols,
-        figsize=(figsize_per_head[0] * ncols, figsize_per_head[1] * nrows),
-    )
-    axes = np.array(axes).flatten()
+    heat = np.zeros((model.cfg.n_layers, model.cfg.n_heads))
+    for layer in range(model.cfg.n_layers):
+        attn = cache[f"blocks.{layer}.attn.hook_pattern"][0]
+        for head in range(model.cfg.n_heads):
+            if subj_idx:
+                heat[layer, head] = attn[head][-1].detach().cpu()[subj_idx].sum().item()
 
-    for h in range(n_heads):
-        plot_attention_head(attention, tokens, layer, h, ax=axes[h])
+    fig, ax = plt.subplots(figsize=(14, 7))
+    im = ax.imshow(heat, aspect="auto", cmap="Blues")
+    plt.colorbar(im, ax=ax, label="Subject Attention Score (final query → subject tokens)")
+    ax.set_xlabel("Head")
+    ax.set_ylabel("Layer")
+    ax.set_title(f'Subject Attention Heatmap\nPrompt: "{prompt}"')
+    ax.set_xticks(range(model.cfg.n_heads))
+    ax.set_yticks(range(model.cfg.n_layers))
 
-    for idx in range(n_heads, len(axes)):
-        axes[idx].set_visible(False)
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
 
-    fig.suptitle(f"All Attention Heads — Layer {layer}", fontsize=14, y=1.02)
-    fig.tight_layout()
     return fig
