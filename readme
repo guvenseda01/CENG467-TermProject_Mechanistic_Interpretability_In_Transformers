@@ -10,23 +10,23 @@
 - [Overview](#overview)
 - [Project Structure](#project-structure)
 - [Setup & Installation](#setup--installation)
-- [Datasets](#datasets)
+- [Dataset](#dataset)
 - [Experiments](#experiments)
-- [Results](#results)
+- [Outputs](#outputs)
 - [References](#references)
 
 ---
 
 ## Overview
 
-This project investigates the internal mechanisms of Transformer-based language models (specifically GPT-2) through the lens of **mechanistic interpretability**. We focus on two core techniques:
+This project investigates the internal mechanisms of GPT-2 through **mechanistic interpretability**. We focus on two core techniques:
 
 | Technique | Goal |
 |---|---|
-| **Attention Head Analysis** | Identify what each attention head attends to and classify head roles (e.g., induction heads, name-mover heads, duplicate-token heads) |
-| **Causal Tracing** | Localize where factual knowledge is stored by patching activations and measuring the effect on model predictions |
+| **Attention Head Analysis** | Identify which heads attend most to subject tokens and measure how ablating them drops factual recall |
+| **Causal Tracing** | Localize where factual knowledge is stored by patching head-level and residual stream activations |
 
-The experiments are conducted on the **CounterFact** dataset, which provides factual statements paired with counterfactual alternatives for probing factual knowledge in the model.
+The experiments are conducted on the **CounterFact** dataset using 100 randomly sampled records.
 
 ---
 
@@ -39,10 +39,19 @@ CENG467-TermProject_Mechanistic_Interpretability_In_Transformers/
 ├── README.md                            # Project documentation
 ├── requirements.txt                     # Python dependencies
 └── src/
-    ├── attention_analysis.py            # Attention head analysis utilities
-    ├── causal_tracing.py                # Causal tracing / activation patching
-    ├── dataset_utils.py                 # Dataset loading and preprocessing
-    └── visualization.py                 # Plotting and visualization helpers
+    ├── attention_analysis.py            # Attention head extraction, classification, ablation
+    ├── causal_tracing.py                # Head-level and residual stream activation patching
+    ├── dataset_utils.py                 # CounterFact loading and preprocessing
+    └── visualization.py                 # Heatmaps, scatter plots, distribution charts
+```
+
+Output directories created automatically by the notebook:
+
+```
+outputs/
+    figures/    ← PNG plots
+    tables/     ← CSV result tables
+results/        ← Summary CSVs and statistical test outputs
 ```
 
 ---
@@ -52,16 +61,14 @@ CENG467-TermProject_Mechanistic_Interpretability_In_Transformers/
 ### Prerequisites
 
 - Python 3.8+
-- CUDA-capable GPU recommended (experiments run on CPU but will be slow)
+- CUDA-capable GPU recommended
 
 ### Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/guvenseda01/CENG467-TermProject_Mechanistic_Interpretability_In_Transformers.git
 cd CENG467-TermProject_Mechanistic_Interpretability_In_Transformers
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
@@ -71,79 +78,108 @@ pip install -r requirements.txt
 jupyter notebook CENG467_Group7_Final_Version.ipynb
 ```
 
-Or open it directly in Google Colab (recommended for GPU access):
+Or open directly in Google Colab (recommended for GPU access):
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/guvenseda01/CENG467-TermProject_Mechanistic_Interpretability_In_Transformers/blob/main/CENG467_Group7_Final_Version.ipynb)
 
 ---
 
-## Datasets
+## Dataset
 
-### CounterFact
-- A benchmark dataset of factual statements paired with counterfactual alternatives (e.g., *"The Eiffel Tower is in Paris"* → *"The Eiffel Tower is in Rome"*).
-- Used for **causal tracing** to localize where factual associations are stored in the model.
-- Source: [rome-beats/counterfact](https://huggingface.co/datasets/NeelNanda/counterfact-tracing)
-
+### CounterFact (`azhx/counterfact`)
+- Factual statements paired with counterfactual alternatives (e.g. *"The mother tongue of Victor Hugo is French"* → target_new: *"German"*).
+- Loaded via HuggingFace `datasets`: `load_dataset("azhx/counterfact")`
+- 100 randomly sampled records used (`RANDOM_SEED=42`)
+- Samples filtered into **GPT-2 correct** and **GPT-2 incorrect** subsets for separate analysis
 
 ---
 
 ## Experiments
 
-### 1. Attention Head Analysis
+### 1. Baseline Factual Accuracy
 
-We extract and visualize the attention patterns of all heads in GPT-2 across different token positions.
+For each sample, the notebook records:
+- GPT-2's predicted next token vs. the true target
+- Target token probability, logit, and rank
+- Whether the target appears in the top-5 predictions
 
-Key steps:
-- Hook into each attention layer using TransformerLens
-- Compute **attention rollout** and direct **QK attention scores**
-- Classify heads by their behavior patterns:
-  - **Induction Heads**: Copy previous token patterns (Layer 5–6)
-  - **Name-Mover Heads**: Move subject tokens to the output position
-  - **Duplicate Token Heads**: Detect repeated tokens in context
+Results saved to `outputs/tables/baseline_stats.csv`.
 
-```python
-from src.attention_analysis import load_model, get_attention_patterns, classify_heads
+### 2. Top-k Subject Head Ablation
 
-model = load_model("gpt2")
-patterns = get_attention_patterns(model, prompt="The Eiffel Tower is located in")
-head_labels = classify_heads(patterns)
+Heads are ranked by how strongly their final-query attention focuses on the subject entity tokens. The top-k heads are zeroed out (`hook_z`) and the effect on prediction and probability is measured.
+
+`TOP_K_VALUES = [1, 3, 5, 10]`
+
+Metrics recorded: prediction change rate, probability drop, logit drop, rank drop, KL divergence.
+
+Results saved to `outputs/tables/topk_ablation_results.csv`.
+
+### 3. Control Groups
+
+Two control ablations run at k=5 and k=10:
+- **Random heads** — k randomly selected (layer, head) pairs
+- **Low-attention heads** — k heads with the *lowest* subject attention scores
+
+Allows testing whether subject-focused heads are specifically important, or whether ablating any heads causes similar disruption.
+
+### 4. Relation Type Analysis
+
+Ablation impact broken down by `relation_id` (e.g. country-capital, language, employer) to identify which fact types are most dependent on subject-attending heads.
+
+Plot saved to `outputs/figures/relation_type_analysis.png`.
+
+### 5. Subject Attention vs. Probability Drop (Scatter)
+
+Scatter plot of each head's subject attention score against the probability drop caused by ablating that single head. Pearson correlation computed for all samples and for GPT-2-correct samples separately.
+
+Plot saved to `outputs/figures/scatter_attention_vs_probdrop.png`.
+
+### 6. Head-Level Activation Patching
+
+For three hand-picked (clean, corrupted, target) pairs, each head's output is copied from the clean run into the corrupted run. The **recovery score** measures how much of the target probability is restored:
+
+```
+recovery = (patched_prob − corrupted_prob) / (clean_prob − corrupted_prob)
 ```
 
-### 2. Causal Tracing
+Recovery heatmaps saved to `outputs/figures/head_patching_<target>.png`.
 
-We implement the **activation patching** technique from the ROME paper (Meng et al., 2022) to trace where factual knowledge is encoded.
+### 7. Residual Stream Causal Tracing
 
-Key steps:
-- Run the model on a **clean** prompt (factual) and a **corrupted** prompt (noisy subject tokens)
-- Patch activations layer by layer from the clean run into the corrupted run
-- Measure the **indirect effect** on the target token probability
+For each (layer, token position), the residual stream activation (`hook_resid_pre`) is patched from clean into corrupted. The resulting recovery heatmap is the standard causal tracing figure from Meng et al. (2022).
 
-```python
-from src.causal_tracing import run_causal_trace
+Heatmaps saved to `outputs/figures/causal_tracing_<target>.png`.
 
-results = run_causal_trace(
-    model=model,
-    tokenizer=tokenizer,
-    prompt="The capital of France is",
-    subject="France",
-    target=" Paris"
-)
-# results contains indirect effect scores per (layer, position)
-```
+### 8. Statistical Significance
 
-The heatmaps produced show that factual knowledge is most strongly localized in **early-to-mid MLP layers** (layers 3–8 in GPT-2).
+- **Chi-square** tests on prediction change rates (subject vs. random, subject vs. low-attention)
+- **Mann-Whitney U** tests on probability drops
+- **Wilcoxon signed-rank** tests on paired probability drops
+- **Bootstrap 95% confidence intervals** on mean probability drop
+
+Results saved to `results/statistical_tests.csv`.
 
 ---
 
-## Results
+## Outputs
 
-| Experiment | Key Finding |
+| File | Description |
 |---|---|
-| Attention Head Classification | Induction heads reliably detected at layers 5–6; name-mover heads at layers 9–11 |
-| Causal Tracing (CounterFact) | Highest indirect effect at MLP layers 3–8, subject's last token position |
-
-
-Visualizations (attention heatmaps and causal trace plots) are generated inline in the notebook.
+| `outputs/tables/baseline_stats.csv` | Per-sample baseline prediction and probability stats |
+| `outputs/tables/topk_ablation_results.csv` | Top-k subject head ablation results |
+| `outputs/tables/random_ablation_results.csv` | Random head ablation control |
+| `outputs/tables/low_ablation_results.csv` | Low-attention head ablation control |
+| `outputs/tables/ablation_comparison.csv` | All ablation types merged |
+| `outputs/tables/scatter_attention_vs_probdrop.csv` | Per-(sample, head) attention score and probability drop |
+| `outputs/tables/head_activation_patching.csv` | Head patching recovery scores |
+| `outputs/tables/causal_tracing_residual_patching.csv` | Residual stream patching recovery scores |
+| `outputs/tables/top_causal_heads.csv` | Top-5 causal heads per target |
+| `outputs/tables/top_causal_tracing_positions.csv` | Top-10 (layer, position) pairs per target |
+| `results/filtering_summary.csv` | Ablation stats split by GPT-2 correctness |
+| `results/relation_type_summary.csv` | Ablation stats per relation type |
+| `results/control_comparison_summary.csv` | Subject vs. random vs. low-attention summary |
+| `results/statistical_tests.csv` | Statistical test results |
 
 ---
 
