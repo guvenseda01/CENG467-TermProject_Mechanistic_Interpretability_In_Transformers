@@ -1,210 +1,206 @@
 """
 visualization.py
 ----------------
-Shared plotting helpers for the Mechanistic Interpretability project.
-Covers summary plots for multi-sample causal tracing, head score matrices,
-and attention rollout visualizations.
+Shared plotting helpers for the CENG467 Group 7 project.
 
-Usage:
-    from src.visualization import plot_aggregate_causal_trace, plot_head_scores
+Covers:
+    - Ablation comparison bar charts
+    - Probability drop distribution histograms
+    - Scatter: subject attention score vs probability drop
+    - Relation type bar charts
 """
 
 from __future__ import annotations
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-import seaborn as sns
+import pandas as pd
 from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Causal trace — aggregate over many samples
+# Ablation comparison
 # ---------------------------------------------------------------------------
 
-def plot_aggregate_causal_trace(
-    indirect_effects: list[np.ndarray],
-    token_kind: str = "subject last",
-    figsize: tuple[int, int] = (10, 5),
-    title: Optional[str] = None,
-    cmap: str = "Purples",
+def plot_ablation_comparison(
+    comp_summary: pd.DataFrame,
+    save_path: Optional[str] = None,
 ) -> plt.Figure:
     """
-    Average indirect effect heatmaps from multiple causal tracing runs and plot.
+    Bar charts comparing mean probability drop and prediction change rate
+    across subject / random / low-attention ablation types.
 
     Args:
-        indirect_effects: List of (n_layers, seq) indirect effect arrays.
-                          All arrays must have the same shape.
-        token_kind: Label for x-axis description.
-        figsize: Figure size.
-        title: Optional title override.
-        cmap: Colormap.
+        comp_summary: DataFrame with columns:
+                      ablation_type, mean_prob_drop, change_rate.
+        save_path:    If given, save the figure here.
 
     Returns:
         The matplotlib Figure.
     """
-    stacked = np.stack(indirect_effects, axis=0)      # (N, n_layers, seq)
-    mean_ie = stacked.mean(axis=0)                     # (n_layers, seq)
-    n_layers, seq_len = mean_ie.shape
+    colors = [
+        "#4C72B0" if "subject" in t else
+        "#8C8C8C" if "random"  in t else
+        "#DD8452"
+        for t in comp_summary["ablation_type"].astype(str)
+    ]
 
-    fig, ax = plt.subplots(figsize=figsize)
-    im = ax.imshow(mean_ie, aspect="auto", cmap=cmap, vmin=0, vmax=1)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    ax.set_xlabel(f"Token position ({token_kind})", fontsize=11)
-    ax.set_ylabel("Layer", fontsize=11)
-    ax.set_yticks(range(n_layers))
-    ax.set_yticklabels([f"L{l}" for l in range(n_layers)], fontsize=8)
-    ax.set_xticks(range(seq_len))
-    ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    axes[0].bar(comp_summary["ablation_type"].astype(str),
+                comp_summary["mean_prob_drop"], color=colors)
+    axes[0].set_ylabel("Mean Target Probability Drop")
+    axes[0].set_title("Subject-Focused vs Random vs Low-Attention Ablation")
+    axes[0].tick_params(axis="x", rotation=35)
 
-    plt.colorbar(im, ax=ax, label="Mean Indirect Effect", shrink=0.8)
-    ax.set_title(title or f"Aggregate Causal Trace (n={len(indirect_effects)})", fontsize=13)
+    axes[1].bar(comp_summary["ablation_type"].astype(str),
+                comp_summary["change_rate"], color=colors)
+    axes[1].set_ylabel("Prediction Change Rate")
+    axes[1].set_title("Prediction Change Rate Comparison")
+    axes[1].tick_params(axis="x", rotation=35)
 
-    fig.tight_layout()
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Attention head score matrix
+# Probability drop distributions
 # ---------------------------------------------------------------------------
 
-def plot_head_scores(
-    scores: np.ndarray,
-    title: str = "Attention Head Scores",
-    cmap: str = "YlOrRd",
-    annot: bool = True,
-    figsize: Optional[tuple[int, int]] = None,
+def plot_prob_drop_distributions(
+    subject_df: pd.DataFrame,
+    random_df: pd.DataFrame,
+    low_df: pd.DataFrame,
+    k_values: list[int] = [5, 10],
+    save_path: Optional[str] = None,
 ) -> plt.Figure:
     """
-    Plot a (n_layers × n_heads) score matrix as a labeled heatmap.
+    Histogram of probability drops for subject / random / low-attention ablations.
 
     Args:
-        scores: 2D numpy array of shape (n_layers, n_heads).
-        title: Plot title.
-        cmap: Colormap.
-        annot: Whether to annotate cells with numeric values.
-        figsize: Figure size. Auto-computed if None.
+        subject_df: Top-k ablation DataFrame (has 'top_k' and 'probability_drop').
+        random_df:  Random ablation DataFrame (has 'k' and 'probability_drop').
+        low_df:     Low-attention ablation DataFrame (has 'k' and 'probability_drop').
+        k_values:   List of k values to plot (one subplot per k).
+        save_path:  If given, save the figure here.
 
     Returns:
         The matplotlib Figure.
     """
-    n_layers, n_heads = scores.shape
-    if figsize is None:
-        figsize = (max(6, n_heads * 0.8), max(4, n_layers * 0.5))
+    fig, axes = plt.subplots(1, len(k_values), figsize=(6 * len(k_values), 4))
+    if len(k_values) == 1:
+        axes = [axes]
 
-    fig, ax = plt.subplots(figsize=figsize)
-    sns.heatmap(
-        scores,
-        ax=ax,
-        cmap=cmap,
-        vmin=0,
-        vmax=scores.max() if scores.max() > 0 else 1,
-        annot=annot,
-        fmt=".2f",
-        xticklabels=[f"H{h}" for h in range(n_heads)],
-        yticklabels=[f"L{l}" for l in range(n_layers)],
-        linewidths=0.4,
-        linecolor="lightgrey",
-        cbar_kws={"shrink": 0.7},
-    )
-    ax.set_xlabel("Head", fontsize=11)
-    ax.set_ylabel("Layer", fontsize=11)
-    ax.set_title(title, fontsize=13)
-    ax.tick_params(axis="x", labelsize=9)
-    ax.tick_params(axis="y", rotation=0, labelsize=9)
+    for ax, k in zip(axes, k_values):
+        ax.hist(subject_df[subject_df["top_k"] == k]["probability_drop"],
+                bins=25, alpha=0.5, label="Subject",   color="#4C72B0")
+        ax.hist(random_df[random_df["k"] == k]["probability_drop"],
+                bins=25, alpha=0.5, label="Random",    color="#8C8C8C")
+        ax.hist(low_df[low_df["k"] == k]["probability_drop"],
+                bins=25, alpha=0.5, label="Low-attn",  color="#DD8452")
+        ax.set_xlabel("Probability Drop")
+        ax.set_ylabel("Count")
+        ax.set_title(f"Probability Drop Distribution (Top-{k})")
+        ax.legend()
 
-    fig.tight_layout()
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Token probability bar chart
+# Scatter: subject attention vs probability drop
 # ---------------------------------------------------------------------------
 
-def plot_top_predictions(
-    logits: "torch.Tensor",   # noqa: F821
-    tokenizer,
-    top_k: int = 10,
-    title: str = "Top-k Predictions",
-    figsize: tuple[int, int] = (8, 4),
+def plot_attention_vs_probdrop(
+    scatter_df: pd.DataFrame,
+    save_path: Optional[str] = None,
 ) -> plt.Figure:
     """
-    Bar chart of the top-k predicted tokens at the last position.
+    Scatter plot of subject attention score vs probability drop (single-head ablation).
 
     Args:
-        logits: Model logits tensor, shape (batch, seq, vocab) or (seq, vocab).
-        tokenizer: The model's tokenizer (must have decode()).
-        top_k: Number of top tokens to show.
-        title: Plot title.
-        figsize: Figure size.
+        scatter_df: DataFrame with columns:
+                    subject_attention_score, probability_drop, gpt2_correct.
+        save_path:  If given, save the figure here.
 
     Returns:
         The matplotlib Figure.
     """
-    import torch
+    from scipy import stats as scipy_stats
 
-    if logits.dim() == 3:
-        last = logits[0, -1, :]
-    else:
-        last = logits[-1, :]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    probs = torch.softmax(last, dim=-1)
-    top_probs, top_ids = probs.topk(top_k)
-    top_probs = top_probs.detach().cpu().numpy()
-    top_tokens = [repr(tokenizer.decode([tid.item()])) for tid in top_ids]
+    axes[0].scatter(scatter_df["subject_attention_score"],
+                    scatter_df["probability_drop"],
+                    alpha=0.15, s=6, color="#4C72B0")
+    r, p = scipy_stats.pearsonr(scatter_df["subject_attention_score"],
+                                 scatter_df["probability_drop"])
+    axes[0].set_xlabel("Subject Attention Score")
+    axes[0].set_ylabel("Probability Drop after Single-Head Ablation")
+    axes[0].set_title(f"All Examples\nPearson r={r:.3f}, p={p:.4f}")
 
-    fig, ax = plt.subplots(figsize=figsize)
-    bars = ax.barh(range(top_k), top_probs[::-1], color="steelblue", edgecolor="white")
-    ax.set_yticks(range(top_k))
-    ax.set_yticklabels(top_tokens[::-1], fontsize=9)
-    ax.set_xlabel("Probability", fontsize=10)
-    ax.set_title(title, fontsize=12)
-    ax.set_xlim(0, top_probs[0] * 1.15)
+    correct = scatter_df[scatter_df["gpt2_correct"]]
+    axes[1].scatter(correct["subject_attention_score"],
+                    correct["probability_drop"],
+                    alpha=0.2, s=6, color="#2ca02c")
+    if len(correct) > 1:
+        r2, p2 = scipy_stats.pearsonr(correct["subject_attention_score"],
+                                       correct["probability_drop"])
+        axes[1].set_title(f"GPT-2 Correct Examples Only\nPearson r={r2:.3f}, p={p2:.4f}")
+    axes[1].set_xlabel("Subject Attention Score")
+    axes[1].set_ylabel("Probability Drop after Single-Head Ablation")
 
-    for bar, prob in zip(bars, top_probs[::-1]):
-        ax.text(
-            bar.get_width() + 0.002, bar.get_y() + bar.get_height() / 2,
-            f"{prob:.3f}", va="center", fontsize=8,
-        )
-
-    fig.tight_layout()
+    plt.suptitle("Subject Attention Score vs Probability Drop (Single-Head Ablation)",
+                 fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Attention rollout
+# Relation type analysis
 # ---------------------------------------------------------------------------
 
-def compute_attention_rollout(
-    attention_matrices: "torch.Tensor",  # (n_layers, n_heads, seq, seq)
-    add_residual: bool = True,
-) -> np.ndarray:
+def plot_relation_type_analysis(
+    relation_summary: pd.DataFrame,
+    overall_change_rate: float,
+    overall_prob_drop: float,
+    save_path: Optional[str] = None,
+) -> plt.Figure:
     """
-    Compute attention rollout (Abnar & Zuidema, 2020).
-
-    Rollout recursively multiplies attention matrices from layer 0 to L,
-    optionally adding a residual identity term to model skip connections.
+    Horizontal bar charts of change rate and probability drop per relation type.
 
     Args:
-        attention_matrices: Tensor of shape (n_layers, n_heads, seq, seq).
-        add_residual: Whether to add 0.5 * identity to each layer's attention.
+        relation_summary:    DataFrame with columns: relation_id, change_rate, mean_prob_drop.
+        overall_change_rate: Overall mean change rate (drawn as a red dashed reference line).
+        overall_prob_drop:   Overall mean probability drop (reference line).
+        save_path:           If given, save the figure here.
 
     Returns:
-        Rollout matrix as numpy array, shape (seq, seq).
+        The matplotlib Figure.
     """
-    import torch
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    n_layers, n_heads, seq, _ = attention_matrices.shape
-    # Average over heads
-    avg_attn = attention_matrices.mean(dim=1)    # (n_layers, seq, seq)
+    axes[0].barh(relation_summary["relation_id"],
+                 relation_summary["change_rate"], color="#4C72B0")
+    axes[0].set_xlabel("Change Rate")
+    axes[0].set_title("Prediction Change Rate by Relation Type\n(Top-5 Subject Head Ablation)")
+    axes[0].axvline(overall_change_rate, color="red", linestyle="--", label="Overall mean")
+    axes[0].legend()
 
-    rollout = torch.eye(seq, device=attention_matrices.device)
-    for l in range(n_layers):
-        A = avg_attn[l]
-        if add_residual:
-            A = 0.5 * A + 0.5 * torch.eye(seq, device=A.device)
-        # Normalize rows
-        A = A / A.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        rollout = A @ rollout
+    axes[1].barh(relation_summary["relation_id"],
+                 relation_summary["mean_prob_drop"], color="#DD8452")
+    axes[1].set_xlabel("Mean Probability Drop")
+    axes[1].set_title("Target Probability Drop by Relation Type\n(Top-5 Subject Head Ablation)")
+    axes[1].axvline(overall_prob_drop, color="red", linestyle="--", label="Overall mean")
+    axes[1].legend()
 
-    return rollout.cpu().numpy()
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    return fig
