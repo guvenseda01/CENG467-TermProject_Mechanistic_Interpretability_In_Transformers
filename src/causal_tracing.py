@@ -1,18 +1,18 @@
 """
 causal_tracing.py
 -----------------
-Implements the causal tracing / activation patching methodology
-from Meng et al. (2022) "Locating and Editing Factual Associations in GPT".
+Head-level and residual stream activation patching for causal tracing
+experiments (CENG467 Group 7).
 
-The core idea:
-    1. Run the model on a CLEAN prompt  → cache all activations.
-    2. Run the model on a CORRUPTED prompt (subject tokens replaced with noise).
-    3. For each (layer, token position), patch the corrupted run with the
-       clean activation and measure how much the target token probability recovers.
-    4. The resulting "indirect effect" heatmap shows where factual knowledge lives.
+Implements the recovery-score metric from Meng et al. (2022):
+    recovery = (patched_prob - corrupted_prob) / (clean_prob - corrupted_prob)
+
+Two patching strategies:
+    1. head_activation_patching   — patches a single head's hook_z output
+    2. residual_position_patching — patches hook_resid_pre at a (layer, pos)
 
 Usage:
-    from src.causal_tracing import run_causal_trace, plot_causal_trace
+    from src.causal_tracing import head_activation_patching, residual_position_patching
 """
 
 from __future__ import annotations
@@ -20,246 +20,212 @@ from __future__ import annotations
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
-from typing import Optional, Callable
 from transformer_lens import HookedTransformer
 
 
 # ---------------------------------------------------------------------------
-# Helper: corrupt subject tokens with gaussian noise
+# Shared probability helper
 # ---------------------------------------------------------------------------
 
-def _corrupt_tokens(
-    embeddings: torch.Tensor,
-    subject_positions: list[int],
-    noise_scale: float = 3.0,
-) -> torch.Tensor:
-    """
-    Add gaussian noise to the embedding of subject token positions.
-
-    Args:
-        embeddings: Token embedding tensor, shape (batch, seq, d_model).
-        subject_positions: List of token indices corresponding to the subject.
-        noise_scale: Standard deviation of the noise (scaled by embedding std).
-
-    Returns:
-        Corrupted embeddings tensor with the same shape.
-    """
-    corrupted = embeddings.clone()
-    std = embeddings.std().item()
-    noise = torch.randn_like(embeddings[:, subject_positions, :]) * noise_scale * std
-    corrupted[:, subject_positions, :] += noise
-    return corrupted
-
-
-# ---------------------------------------------------------------------------
-# Core causal trace
-# ---------------------------------------------------------------------------
-
-def run_causal_trace(
+def _target_prob_from_logits(
     model: HookedTransformer,
-    prompt: str,
-    subject: str,
+    logits: torch.Tensor,
     target: str,
-    noise_scale: float = 3.0,
-    patch_component: str = "resid_post",   # 'resid_post' | 'mlp_post' | 'attn_out'
-) -> dict:
+) -> tuple[float, float]:
     """
-    Run a full causal tracing experiment for one (prompt, subject, target) triple.
+    Return (probability, logit) of the first subtoken of *target* at the last position.
 
     Args:
-        model: HookedTransformer model.
-        prompt: The factual prompt, e.g. "The capital of France is".
-        subject: The subject entity string within the prompt, e.g. "France".
-        target: The expected factual completion token, e.g. " Paris".
-        noise_scale: Noise level for corrupting subject embeddings.
-        patch_component: Which activation to patch.
-            'resid_post' — full residual stream after each layer (default, matches ROME paper)
-            'mlp_post'   — MLP output only
-            'attn_out'   — attention output only
+        model:  HookedTransformer instance.
+        logits: Tensor of shape (1, seq, vocab).
+        target: Target word (space prefix added automatically).
 
     Returns:
-        Dictionary with:
-            'clean_prob'     : probability of target on clean run
-            'corrupt_prob'   : probability of target on corrupted run
-            'indirect_effect': 2D numpy array (n_layers, seq_len) of indirect effects
-            'tokens'         : list of token strings
-            'subject_positions': list of token positions for the subject
+        Tuple of (probability, logit_value).
     """
-    tokenizer = model.tokenizer
-    device = next(model.parameters()).device
+    next_logits = logits[0, -1]
+    probs = torch.softmax(next_logits, dim=-1)
+    tid = model.to_tokens(" " + target, prepend_bos=False)[0][0].item()
+    return probs[tid].item(), next_logits[tid].item()
 
-    # Tokenize
-    tokens = model.to_tokens(prompt)                      # (1, seq)
-    token_strs = model.to_str_tokens(prompt)
-    target_id = model.to_single_token(target)
 
-    # Find subject positions
-    subject_tokens = model.to_tokens(subject, prepend_bos=False)[0].tolist()
-    subject_positions = _find_subject_positions(tokens[0].tolist(), subject_tokens)
+# ---------------------------------------------------------------------------
+# Head-level activation patching
+# ---------------------------------------------------------------------------
 
-    if not subject_positions:
-        raise ValueError(
-            f"Subject '{subject}' (tokens {subject_tokens}) not found in prompt tokens."
-        )
+def head_activation_patching(
+    model: HookedTransformer,
+    clean_prompt: str,
+    corrupted_prompt: str,
+    target: str,
+    layer: int,
+    head: int,
+) -> dict | None:
+    """
+    Patch a single head's hook_z from the clean run into the corrupted run.
 
-    # ── 1. Clean run ──────────────────────────────────────────────────────────
-    with torch.no_grad():
-        clean_logits, clean_cache = model.run_with_cache(tokens, remove_batch_dim=False)
+    Args:
+        model:             HookedTransformer instance.
+        clean_prompt:      Factual prompt (e.g. "The mother tongue of Victor Hugo is").
+        corrupted_prompt:  Counterfactual prompt (e.g. "The mother tongue of Albert Einstein is").
+        target:            Expected factual token (e.g. "French").
+        layer:             Layer index.
+        head:              Head index.
 
-    clean_prob = _target_prob(clean_logits, target_id)
+    Returns:
+        Dict with clean_prob, corrupted_prob, patched_prob, recovery_score,
+        or None if prompts tokenise to different lengths.
+    """
+    clean_tokens     = model.to_tokens(clean_prompt)
+    corrupted_tokens = model.to_tokens(corrupted_prompt)
 
-    # ── 2. Corrupted run ──────────────────────────────────────────────────────
-    def corrupt_hook(value: torch.Tensor, hook) -> torch.Tensor:
-        """Hook that corrupts the embedding layer output for subject positions."""
-        return _corrupt_tokens(value, subject_positions, noise_scale)
+    if clean_tokens.shape != corrupted_tokens.shape:
+        return None
 
-    with torch.no_grad():
-        corrupt_logits, corrupt_cache = model.run_with_cache(
-            tokens,
-            fwd_hooks=[("hook_embed", corrupt_hook)],
-            remove_batch_dim=False,
-        )
+    clean_logits, clean_cache = model.run_with_cache(clean_tokens)
+    clean_z = clean_cache[f"blocks.{layer}.attn.hook_z"].clone()
 
-    corrupt_prob = _target_prob(corrupt_logits, target_id)
+    corrupted_logits, _ = model.run_with_cache(corrupted_tokens)
 
-    # ── 3. Patching sweep ─────────────────────────────────────────────────────
-    n_layers = model.cfg.n_layers
-    seq_len = tokens.shape[1]
-    indirect_effect = np.zeros((n_layers, seq_len))
+    def patch_fn(value: torch.Tensor, hook) -> torch.Tensor:
+        value[:, :, head, :] = clean_z[:, :, head, :]
+        return value
 
-    for layer_idx in range(n_layers):
-        for pos in range(seq_len):
-            hook_name = _get_hook_name(layer_idx, patch_component)
-            clean_act = clean_cache[hook_name]  # (1, seq, d_model)
+    patched_logits = model.run_with_hooks(
+        corrupted_tokens,
+        fwd_hooks=[(f"blocks.{layer}.attn.hook_z", patch_fn)],
+    )
 
-            def patch_hook(value: torch.Tensor, hook, _l=layer_idx, _p=pos) -> torch.Tensor:
-                patched = value.clone()
-                patched[:, _p, :] = clean_act[:, _p, :]
-                return patched
+    cp,  _ = _target_prob_from_logits(model, clean_logits,     target)
+    crp, _ = _target_prob_from_logits(model, corrupted_logits, target)
+    pp,  _ = _target_prob_from_logits(model, patched_logits,   target)
 
-            with torch.no_grad():
-                patched_logits = model.run_with_cache(
-                    tokens,
-                    fwd_hooks=[
-                        ("hook_embed", corrupt_hook),
-                        (hook_name, patch_hook),
-                    ],
-                    remove_batch_dim=False,
-                )[0]
-
-            patched_prob = _target_prob(patched_logits, target_id)
-            # Indirect effect: how much probability recovered relative to clean–corrupt gap
-            gap = clean_prob - corrupt_prob
-            if abs(gap) > 1e-8:
-                indirect_effect[layer_idx, pos] = (patched_prob - corrupt_prob) / gap
-            else:
-                indirect_effect[layer_idx, pos] = 0.0
+    denom    = cp - crp
+    recovery = (pp - crp) / denom if abs(denom) > 1e-6 else 0.0
 
     return {
-        "clean_prob": clean_prob,
-        "corrupt_prob": corrupt_prob,
-        "indirect_effect": indirect_effect,
-        "tokens": token_strs,
-        "subject_positions": subject_positions,
+        "layer": layer, "head": head,
+        "clean_prob":     cp,
+        "corrupted_prob": crp,
+        "patched_prob":   pp,
+        "recovery_score": recovery,
     }
 
 
 # ---------------------------------------------------------------------------
-# Visualization
+# Residual stream position patching
 # ---------------------------------------------------------------------------
 
-def plot_causal_trace(
-    result: dict,
-    title: Optional[str] = None,
-    figsize: tuple[int, int] = (12, 6),
-    cmap: str = "RdYlGn",
-) -> plt.Figure:
+def residual_position_patching(
+    model: HookedTransformer,
+    clean_prompt: str,
+    corrupted_prompt: str,
+    target: str,
+    layer: int,
+    pos: int,
+) -> dict | None:
     """
-    Visualize the indirect effect heatmap from a causal tracing result.
+    Patch hook_resid_pre at (layer, pos) from the clean run into the corrupted run.
+
+    This is the standard causal tracing procedure from Meng et al. (2022).
 
     Args:
-        result: Output dict from run_causal_trace().
-        title: Optional figure title.
-        figsize: Figure size.
-        cmap: Matplotlib colormap name.
+        model:             HookedTransformer instance.
+        clean_prompt:      Factual prompt.
+        corrupted_prompt:  Counterfactual prompt.
+        target:            Expected factual token.
+        layer:             Layer index.
+        pos:               Token position index.
+
+    Returns:
+        Dict with layer, position, clean_prob, corrupted_prob, patched_prob,
+        recovery_score, or None on token length mismatch.
+    """
+    clean_tokens     = model.to_tokens(clean_prompt)
+    corrupted_tokens = model.to_tokens(corrupted_prompt)
+
+    if clean_tokens.shape != corrupted_tokens.shape:
+        return None
+
+    hook_name = f"blocks.{layer}.hook_resid_pre"
+
+    clean_logits, clean_cache = model.run_with_cache(clean_tokens)
+    corrupted_logits          = model(corrupted_tokens)
+    clean_resid               = clean_cache[hook_name].clone()
+
+    def patch_fn(value: torch.Tensor, hook) -> torch.Tensor:
+        value[:, pos, :] = clean_resid[:, pos, :]
+        return value
+
+    patched_logits = model.run_with_hooks(
+        corrupted_tokens,
+        fwd_hooks=[(hook_name, patch_fn)],
+    )
+
+    cp,  _ = _target_prob_from_logits(model, clean_logits,     target)
+    crp, _ = _target_prob_from_logits(model, corrupted_logits, target)
+    pp,  _ = _target_prob_from_logits(model, patched_logits,   target)
+
+    denom    = cp - crp
+    recovery = (pp - crp) / denom if abs(denom) > 1e-6 else 0.0
+
+    return {
+        "layer":          layer,
+        "position":       pos,
+        "clean_prob":     cp,
+        "corrupted_prob": crp,
+        "patched_prob":   pp,
+        "recovery_score": recovery,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
+
+def plot_recovery_heatmap(
+    recovery_matrix: np.ndarray,
+    xlabel: str = "Token Position",
+    ylabel: str = "Layer",
+    xticklabels: list[str] | None = None,
+    title: str = "Activation Patching Recovery Scores",
+    save_path: str | None = None,
+) -> plt.Figure:
+    """
+    Plot a recovery score heatmap (layers × positions or layers × heads).
+
+    Args:
+        recovery_matrix: 2-D numpy array of recovery scores.
+        xlabel:          X-axis label.
+        ylabel:          Y-axis label.
+        xticklabels:     Optional list of tick labels for the x-axis.
+        title:           Plot title.
+        save_path:       If given, save the figure here.
 
     Returns:
         The matplotlib Figure.
     """
-    ie = result["indirect_effect"]     # (n_layers, seq)
-    tokens = result["tokens"]
-    subject_positions = result["subject_positions"]
+    n_rows, n_cols = recovery_matrix.shape
 
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(figsize=(max(10, n_cols * 0.7), max(5, n_rows * 0.45)))
+    im = ax.imshow(recovery_matrix, aspect="auto", cmap="RdYlGn", vmin=0, vmax=1)
+    plt.colorbar(im, ax=ax, label="Recovery Score  (0 = corrupted, 1 = clean)")
 
-    sns.heatmap(
-        ie,
-        ax=ax,
-        cmap=cmap,
-        center=0,
-        vmin=-0.1,
-        vmax=1.0,
-        xticklabels=tokens,
-        yticklabels=[f"L{l}" for l in range(ie.shape[0])],
-        linewidths=0.3,
-        linecolor="grey",
-        cbar_kws={"label": "Indirect Effect (normalized)", "shrink": 0.8},
-    )
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.set_title(title, fontsize=13)
+    ax.set_yticks(range(n_rows))
+    ax.set_yticklabels([f"L{l}" for l in range(n_rows)], fontsize=8)
 
-    # Highlight subject token columns
-    for pos in subject_positions:
-        ax.add_patch(plt.Rectangle(
-            (pos, 0), 1, ie.shape[0],
-            fill=False, edgecolor="blue", linewidth=2, linestyle="--",
-        ))
-
-    ax.set_xlabel("Token Position", fontsize=11)
-    ax.set_ylabel("Layer", fontsize=11)
-    ax.tick_params(axis="x", rotation=45, labelsize=9)
-    ax.tick_params(axis="y", rotation=0, labelsize=9)
-
-    clean_p = result["clean_prob"]
-    corrupt_p = result["corrupt_prob"]
-    default_title = (
-        f"Causal Trace  |  clean p={clean_p:.3f}  corrupt p={corrupt_p:.3f}\n"
-        f"Blue dashed = subject tokens"
-    )
-    ax.set_title(title or default_title, fontsize=12)
+    if xticklabels:
+        ax.set_xticks(range(len(xticklabels)))
+        ax.set_xticklabels(xticklabels, rotation=45, ha="right", fontsize=8)
+    else:
+        ax.set_xticks(range(n_cols))
 
     fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+
     return fig
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _target_prob(logits: torch.Tensor, target_id: int) -> float:
-    """Return the probability of target_id at the final token position."""
-    last_logits = logits[0, -1, :]          # (vocab,)
-    probs = torch.softmax(last_logits, dim=-1)
-    return probs[target_id].item()
-
-
-def _find_subject_positions(token_ids: list[int], subject_token_ids: list[int]) -> list[int]:
-    """Find start positions of subject_token_ids inside token_ids."""
-    positions = []
-    n = len(subject_token_ids)
-    for i in range(len(token_ids) - n + 1):
-        if token_ids[i: i + n] == subject_token_ids:
-            positions = list(range(i, i + n))
-            break
-    return positions
-
-
-def _get_hook_name(layer: int, component: str) -> str:
-    """Map a component name to the TransformerLens hook point name."""
-    mapping = {
-        "resid_post": f"blocks.{layer}.hook_resid_post",
-        "mlp_post":   f"blocks.{layer}.hook_mlp_out",
-        "attn_out":   f"blocks.{layer}.attn.hook_z",
-    }
-    if component not in mapping:
-        raise ValueError(f"Unknown component '{component}'. Choose from: {list(mapping)}")
-    return mapping[component]
