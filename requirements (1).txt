@@ -1,27 +1,12 @@
-# Core ML / NLP
 torch>=2.0.0
 transformers>=4.35.0
 datasets>=2.14.0
-
-# Mechanistic Interpretability
 transformer-lens>=1.14.0
-
-# Scientific computing
 numpy>=1.24.0
 scipy>=1.10.0
 pandas>=2.0.0
-
-# Visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0
-plotly>=5.15.0
-
-# Notebook
 jupyter>=1.0.0
-ipywidgets>=8.0.0
 tqdm>=4.65.0
-
-# Utilities
 einops>=0.7.0
-jaxtyping>=0.2.20
-fancy-einsum>=0.0.3
