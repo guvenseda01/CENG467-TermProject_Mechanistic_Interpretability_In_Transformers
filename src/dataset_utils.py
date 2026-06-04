@@ -1,11 +1,11 @@
 """
 dataset_utils.py
 ----------------
-Utilities for loading and preprocessing the CounterFact dataset
-for use in mechanistic interpretability experiments.
+CounterFact dataset loading and preprocessing for mechanistic
+interpretability experiments (CENG467 Group 7).
 
 Usage:
-    from src.dataset_utils import load_counterfact, CounterFactSample
+    from src.dataset_utils import load_counterfact, get_sample
 """
 
 from __future__ import annotations
@@ -16,85 +16,77 @@ from typing import Optional
 from datasets import load_dataset
 
 
-# ---------------------------------------------------------------------------
-# Data container
-# ---------------------------------------------------------------------------
+NUM_SAMPLES  = 100
+RANDOM_SEED  = 42
+
 
 @dataclass
 class CounterFactSample:
     """One record from the CounterFact dataset."""
-    case_id: int
-    subject: str
-    relation: str
-    target_true: str        # The correct factual completion
-    target_new: str         # The counterfactual completion
-    prompt: str             # "{subject} ... is"
-    rephrase_prompts: list[str]
+    sample_id:        int
+    subject:          str
+    relation_id:      str
+    prompt:           str
+    target_true:      str
+    target_new:       str
 
-
-# ---------------------------------------------------------------------------
-# CounterFact
-# ---------------------------------------------------------------------------
 
 def load_counterfact(
+    hf_name: str = "azhx/counterfact",
     split: str = "train",
-    max_samples: Optional[int] = 500,
-    seed: int = 42,
+    num_samples: int = NUM_SAMPLES,
+    seed: int = RANDOM_SEED,
 ) -> list[CounterFactSample]:
     """
-    Load a subset of the CounterFact dataset.
+    Load and shuffle a fixed subset of CounterFact.
 
     Args:
-        split: Dataset split ('train' is the only available split).
-        max_samples: Maximum number of samples to return. None for all.
-        seed: Random seed for sampling.
+        hf_name:     HuggingFace dataset identifier.
+        split:       Dataset split to use.
+        num_samples: Number of samples to select after shuffling.
+        seed:        Random seed for reproducibility.
 
     Returns:
         List of CounterFactSample objects.
     """
-    ds = load_dataset("NeelNanda/counterfact-tracing", split=split)
-
-    indices = list(range(len(ds)))
-    if max_samples is not None and max_samples < len(indices):
-        random.seed(seed)
-        indices = random.sample(indices, max_samples)
+    ds = load_dataset(hf_name, split=split)
+    ds = ds.shuffle(seed=seed).select(range(num_samples))
 
     samples = []
-    for i in indices:
-        row = ds[i]
+    for i, row in enumerate(ds):
+        rw = row["requested_rewrite"]
         samples.append(CounterFactSample(
-            case_id=row.get("case_id", i),
-            subject=row["requested_rewrite"]["subject"],
-            relation=row["requested_rewrite"]["relation_id"],
-            target_true=row["requested_rewrite"]["target_true"]["str"],
-            target_new=row["requested_rewrite"]["target_new"]["str"],
-            prompt=row["requested_rewrite"]["prompt"].format(
-                row["requested_rewrite"]["subject"]
-            ),
-            rephrase_prompts=row.get("paraphrase_prompts", []),
+            sample_id   = i,
+            subject     = rw["subject"],
+            relation_id = rw.get("relation_id", "unknown"),
+            prompt      = rw["prompt"].format(rw["subject"]),
+            target_true = rw["target_true"]["str"],
+            target_new  = rw["target_new"]["str"],
         ))
 
-    print(f"Loaded {len(samples)} CounterFact samples.")
+    print(f"Loaded {len(samples)} CounterFact samples (seed={seed}).")
     return samples
 
 
-# ---------------------------------------------------------------------------
-# Prompt builder
-# ---------------------------------------------------------------------------
-
-def counterfact_to_prompt(sample: CounterFactSample, use_rephrase: bool = False) -> tuple[str, str, str]:
+def get_sample(dataset_subset, index: int = 0) -> dict:
     """
-    Convert a CounterFactSample to (prompt, subject, target) for causal tracing.
+    Extract a single sample dict from a HuggingFace dataset subset.
+    Mirrors the get_sample() helper used in the notebook.
 
     Args:
-        sample: A CounterFactSample.
-        use_rephrase: If True and rephrase prompts exist, use a random one.
+        dataset_subset: A HuggingFace Dataset slice.
+        index:          Index within the subset.
 
     Returns:
-        Tuple of (prompt_str, subject_str, target_true_str).
+        Dict with keys: subject, prompt, target_true, target_new, relation_id.
     """
-    if use_rephrase and sample.rephrase_prompts:
-        prompt = random.choice(sample.rephrase_prompts)
-    else:
-        prompt = sample.prompt
-    return prompt, sample.subject, " " + sample.target_true
+    sample  = dataset_subset[index]
+    rewrite = sample["requested_rewrite"]
+    subject = rewrite["subject"]
+    return {
+        "subject":     subject,
+        "prompt":      rewrite["prompt"].format(subject),
+        "target_true": rewrite["target_true"]["str"],
+        "target_new":  rewrite["target_new"]["str"],
+        "relation_id": rewrite.get("relation_id", "unknown"),
+    }
