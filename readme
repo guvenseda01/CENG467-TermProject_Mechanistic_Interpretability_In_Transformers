@@ -26,7 +26,7 @@ This project investigates the internal mechanisms of GPT-2 through **mechanistic
 | **Attention Head Analysis** | Identify which heads attend most to subject tokens and measure how ablating them drops factual recall |
 | **Causal Tracing** | Localize where factual knowledge is stored by patching head-level and residual stream activations |
 
-The experiments are conducted on the **CounterFact** dataset using 100 randomly sampled records.
+The experiments are conducted on the **CounterFact** dataset using 300 randomly sampled records.
 
 ---
 
@@ -89,7 +89,7 @@ Or open directly in Google Colab (recommended for GPU access):
 ### CounterFact (`azhx/counterfact`)
 - Factual statements paired with counterfactual alternatives (e.g. *"The mother tongue of Victor Hugo is French"* → target_new: *"German"*).
 - Loaded via HuggingFace `datasets`: `load_dataset("azhx/counterfact")`
-- 100 randomly sampled records used (`RANDOM_SEED=42`)
+- 300 randomly sampled records used (`RANDOM_SEED=42`)
 - Samples filtered into **GPT-2 correct** and **GPT-2 incorrect** subsets for separate analysis
 
 ---
