@@ -16,7 +16,7 @@ from typing import Optional
 from datasets import load_dataset
 
 
-NUM_SAMPLES  = 300
+NUM_SAMPLES  = 100
 RANDOM_SEED  = 42
 
 
