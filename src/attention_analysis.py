@@ -249,3 +249,82 @@ def plot_subject_attention_heatmap(
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
 
     return fig
+
+def plot_subject_attention_heatmap_aggregate(
+    model: HookedTransformer,
+    samples: list,                      # list[CounterFactSample] from dataset_utils
+    correct_sample_ids: set[int] | None = None,
+    save_path: str | None = None,
+) -> plt.Figure:
+    """
+    Plot the subject attention score sigma(l,h) averaged over a whole set of
+    samples, side by side with the average restricted to GPT-2-correct
+    samples (if correct_sample_ids is given). This is the dataset-level
+    counterpart to plot_subject_attention_heatmap(), which shows a single
+    prompt.
+ 
+    Args:
+        model:              HookedTransformer instance.
+        samples:            List of CounterFactSample objects (has .sample_id,
+                             .prompt, .subject).
+        correct_sample_ids: Set of sample_id values that GPT-2 answered
+                             correctly (from baseline_stats.csv /
+                             baseline_df). If None, only the "all samples"
+                             panel is plotted.
+        save_path:          If given, save the figure here.
+ 
+    Returns:
+        The matplotlib Figure.
+    """
+    n_layers, n_heads = model.cfg.n_layers, model.cfg.n_heads
+    sigma_sum_all = np.zeros((n_layers, n_heads))
+    n_all = 0
+    sigma_sum_correct = np.zeros((n_layers, n_heads))
+    n_correct = 0
+ 
+    for sample in samples:
+        tokens = model.to_tokens(sample.prompt)
+        _, cache = model.run_with_cache(tokens)
+        subj_idx = get_subject_token_indices(model, sample.prompt, sample.subject)
+        if not subj_idx:
+            continue  # same skip behaviour as _rank_heads_by_subject
+ 
+        heat = np.zeros((n_layers, n_heads))
+        for layer in range(n_layers):
+            attn = cache[f"blocks.{layer}.attn.hook_pattern"][0]   # (n_heads, seq, seq)
+            for head in range(n_heads):
+                heat[layer, head] = attn[head][-1].detach().cpu()[subj_idx].sum().item()
+ 
+        sigma_sum_all += heat
+        n_all += 1
+        if correct_sample_ids is not None and sample.sample_id in correct_sample_ids:
+            sigma_sum_correct += heat
+            n_correct += 1
+ 
+    sigma_avg_all = sigma_sum_all / max(n_all, 1)
+ 
+    if correct_sample_ids is not None and n_correct > 0:
+        sigma_avg_correct = sigma_sum_correct / n_correct
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        panels = [
+            (axes[0], sigma_avg_all, f"Averaged over N={n_all} samples"),
+            (axes[1], sigma_avg_correct, f"Averaged over {n_correct} GPT-2-correct samples"),
+        ]
+    else:
+        fig, ax = plt.subplots(figsize=(14, 7))
+        panels = [(ax, sigma_avg_all, f"Averaged over N={n_all} samples")]
+ 
+    for ax, heat, title in panels:
+        im = ax.imshow(heat, aspect="auto", cmap="Blues")
+        plt.colorbar(im, ax=ax, label="Subject Attention Score (final query \u2192 subject tokens)")
+        ax.set_xlabel("Head")
+        ax.set_ylabel("Layer")
+        ax.set_title(f"Aggregate Subject Attention Heatmap\n{title}")
+        ax.set_xticks(range(n_heads))
+        ax.set_yticks(range(n_layers))
+ 
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+ 
+    return fig
